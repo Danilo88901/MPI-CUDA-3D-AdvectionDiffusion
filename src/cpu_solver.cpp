@@ -1,4 +1,5 @@
 #include"cpu_solver.h"
+#include<cmath>
 double vanleer(double a, double b) {
 	if (a * b <= 0)return 0.0;
 	return 2 * a * b / (a + b);
