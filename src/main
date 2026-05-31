@@ -1,0 +1,600 @@
+double nu = 1e-3;
+
+//double PI = 3.14159265358979323846;
+double* gpu_optimized_solution(int height, int width, int lentgh) {
+	double dx = 1.0 / (lentgh - 4);
+	double dy = 1.0 / (width - 4);
+	double dz = 1.0 / (height - 4);
+	int n = height * width * lentgh;
+	int size = height * width * lentgh * sizeof(double);
+	double* phi; double* u = (double*)malloc(size); double* v = (double*)malloc(size); double* w = (double*)malloc(size);
+	cudaMallocHost(&phi, size);
+	double xc = 0.5;
+	double yc = 0.5;
+	double zc = 0.5;
+	double sigma0 = 0.08; // Ширина облака (подберите под вашу сетку)
+	//double omega = 2.0 * PI;
+	double wz = 0.25;
+
+	double u0 = 1.0;
+	double v0 = 0.5;
+	double w0 = 0.3;
+
+	fill_velocity(
+		u, v, w,
+		lentgh, width, height,
+		dx, dy, dz,
+		xc, yc,
+		u0, v0, w0
+	);
+	bc_periodic(height, width, lentgh,u); bc_periodic(height, width, lentgh, v); bc_periodic(height, width, lentgh, w);
+
+
+	init(
+		phi,
+		lentgh, width, height,
+		dx, dy, dz,
+		xc, yc, zc,
+		0.0
+	);
+
+	bc_periodic(
+		height, width, lentgh,
+		phi
+	);
+
+
+	double* d_phi_tmp, * d_rhs_phi, * d_rhs_tmp;
+	cudaMalloc(&d_phi_tmp, size); cudaMalloc(&d_rhs_phi, size); cudaMalloc(&d_rhs_tmp, size);
+	cudaMemset(d_phi_tmp, 0, size); cudaMemset(d_rhs_phi, 0, size); cudaMemset(d_rhs_tmp, 0, size);
+
+	double* d_u, * d_v, * d_w, * d_phi;
+	cudaMalloc(&d_u, size); cudaMalloc(&d_v, size); cudaMalloc(&d_w, size); cudaMalloc(&d_phi, size);
+	cudaMemcpy(d_u, u, size, cudaMemcpyHostToDevice); cudaMemcpy(d_v, v, size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_w, w, size, cudaMemcpyHostToDevice); cudaMemcpy(d_phi, phi, size, cudaMemcpyHostToDevice);
+
+	dim3 block_size_main(16, 4, 4);
+	int grid_x = (lentgh + block_size_main.x - 1) / block_size_main.x;
+	int grid_y = (width + block_size_main.y - 1) / block_size_main.y;
+	int grid_z = (height + block_size_main.z - 1) / block_size_main.z;
+	dim3 grid_size_main(grid_x, grid_y, grid_z);
+	//x
+	dim3 block_size_boundary_x(1, 16, 16);
+	int grid_z_boundary_x = (height + block_size_boundary_x.z - 1) / block_size_boundary_x.z;
+	int grid_y_boundary_x = (width + block_size_boundary_x.y - 1) / block_size_boundary_x.y;
+	dim3 grid_size_boundary_x(1, grid_y_boundary_x, grid_z_boundary_x);
+	//y
+	dim3 block_size_boundary_y(16, 1, 16);
+	int grid_z_boundary_y = (height + block_size_boundary_y.z - 1) / block_size_boundary_y.z;
+	int grid_x_boundary_y = (lentgh + block_size_boundary_y.x - 1) / block_size_boundary_y.x;
+
+	dim3 grid_size_boundary_y(grid_x_boundary_y, 1, grid_z_boundary_y);
+
+	//z
+	dim3 block_size_boundary_z(16, 16, 1);
+	int grid_y_boundary_z = (width + block_size_boundary_z.y - 1) / block_size_boundary_z.y;
+	int grid_x_boundary_z = (lentgh + block_size_boundary_z.x - 1) / block_size_boundary_z.x;
+
+	dim3 grid_size_boundary_z(grid_x_boundary_z, grid_y_boundary_z, 1);
+	double rhs_sum0 = 0.0;
+	for (int i = 2; i < height - 2; i++) {
+		for (int j = 2; j < width - 2; j++) {
+			for (int k = 2; k < lentgh - 2; k++) {
+				int idx = i * width * lentgh + j * lentgh + k;
+				rhs_sum0 += phi[idx] * dx * dy * dz;
+
+			}
+		}
+	}
+	double dt = compute_dt(
+		height, width, lentgh,
+		u, v, w,
+		dx, dy, dz,
+		nu,
+		0.1 //CFL
+	);
+
+	double t_final = 1.0;
+	int steps = (int)(t_final / dt);
+	std::cout << "Dt:" << dt << std::endl;
+	std::cout << "Steps:" << steps << std::endl;
+	std::cout << std::endl;
+	int size_shared_memory = (block_size_main.x + 4) * (block_size_main.y + 4) * (block_size_main.z + 4) * sizeof(double);
+	double dx_reverse = 1.0 / dx; double dy_reverse = 1.0 / dy; double dz_reverse = 1.0 / dz;
+	cudaDeviceSynchronize();
+	std::vector<std::pair<double, std::string>> pvd_entries;
+	double* phi_exact = (double*)malloc(size);
+	double* phi_error = (double*)malloc(size);
+	auto start = std::chrono::high_resolution_clock::now();
+
+	for (int step = 0; step < steps; step++) {
+		//cudaMemset(d_rhs_phi, 0, size);
+		optimized_gpu_kernel << <grid_size_main, block_size_main, size_shared_memory >> > (height, width, lentgh, d_phi, 
+			d_u, d_v, d_w, d_rhs_phi, nu, dx_reverse, dy_reverse, dz_reverse);
+		ssprk2_stage1 << <grid_size_main, block_size_main >> > (height, width, lentgh, d_phi_tmp, d_rhs_phi, d_phi, dt);
+		CUDA_CHECK(cudaGetLastError());
+		boundary_conditions_x << <grid_size_boundary_x, block_size_boundary_x >> > (height, width, lentgh, d_phi_tmp);
+		boundary_conditions_y << <grid_size_boundary_y, block_size_boundary_y >> > (height, width, lentgh, d_phi_tmp);
+		boundary_conditions_z << <grid_size_boundary_z, block_size_boundary_z >> > (height, width, lentgh, d_phi_tmp);
+
+		//cudaMemset(d_rhs_tmp, 0, size);
+		optimized_gpu_kernel << <grid_size_main, block_size_main, size_shared_memory >> > (height, width, lentgh, d_phi_tmp, d_u, 
+			d_v, d_w, d_rhs_tmp, nu, dx_reverse, dy_reverse, dz_reverse);
+		ssprk2_stage2 << <grid_size_main, block_size_main >> > (height, width, lentgh, d_phi_tmp, d_rhs_tmp, d_phi, dt);
+		CUDA_CHECK(cudaGetLastError());
+
+		boundary_conditions_x << <grid_size_boundary_x, block_size_boundary_x >> > (height, width, lentgh, d_phi);
+		boundary_conditions_y << <grid_size_boundary_y, block_size_boundary_y >> > (height, width, lentgh, d_phi);
+		boundary_conditions_z << <grid_size_boundary_z, block_size_boundary_z >> > (height, width, lentgh, d_phi);
+		
+
+		if (step % 300 == 0) {
+			std::cout << "Proceded:" << step << std::endl;
+			double rhs_sum_step = 0.0;
+			cudaMemcpy(phi, d_phi, size, cudaMemcpyDeviceToHost);
+			std::ostringstream name;
+			name << "phi_" << std::setw(6) << std::setfill('0') << step << ".vti";
+			const std::string fname = name.str();
+
+			save_vti_scalar_double(fname, phi, lentgh, width, height, 2, dx, dy, dz);
+			pvd_entries.push_back({ step * dt, fname });
+			for (int i = 2; i < height - 2; i++) {
+				for (int j = 2; j < width - 2; j++) {
+					for (int k = 2; k < lentgh - 2; k++) {
+						int idx = i * width * lentgh + j * lentgh + k;
+						rhs_sum_step += phi[idx] * dx * dy * dz;
+
+					}
+				}
+			}
+			double rel_mass_error =
+				fabs(rhs_sum0 - rhs_sum_step)/(fabs(rhs_sum0));
+
+			std::cout << "relative mass error: "
+				<< rel_mass_error
+				<< std::endl;
+			std::cout << "Proceded" << std::endl;
+
+			exact_solution(
+				phi_exact,
+				lentgh, width, height,
+				dx, dy, dz,
+				(step + 1) * dt,
+				xc, yc, zc,
+				u0, v0, w0,
+				nu
+			);
+			std::ostringstream exact_name;
+			exact_name << "phi_exact_"
+				<< std::setw(6)
+				<< std::setfill('0')
+				<< step
+				<< ".vti";
+
+			save_vti_scalar_double(
+				exact_name.str(),
+				phi_exact,
+				lentgh, width, height,
+				2,
+				dx, dy, dz
+			);
+			double l2_rel = 0.0;
+			double linf = 0.0;
+			compute_error(
+				phi,
+				phi_exact,
+				lentgh,
+				width,
+				height,
+				&l2_rel,
+				&linf
+			);
+
+			std::cout << "L2 rel = " << l2_rel << std::endl;
+			std::cout << "Linf   = " << linf << std::endl;
+			for (int i = 2; i < height - 2; i++) {
+				for (int j = 2; j < width - 2; j++) {
+					for (int k = 2; k < lentgh - 2; k++) {
+						int idx = i * width * lentgh + j * lentgh + k;
+						phi_error[idx] = phi[idx] - phi_exact[idx];
+
+
+					}
+				}
+			}
+			std::ostringstream err_name;
+			err_name << "phi_error_"
+				<< std::setw(6)
+				<< std::setfill('0')
+				<< step
+				<< ".vti";
+			save_vti_scalar_double(
+				err_name.str(),
+				phi_error,
+				lentgh, width, height,
+				2,
+				dx, dy, dz
+			);
+		}
+
+
+	}
+	cudaDeviceSynchronize();
+	auto end = std::chrono::high_resolution_clock::now();
+	auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+	std::cout << "It took on Optimized GPU: " << static_cast<double>(dur.count() / 1000.0) << " seconds" << std::endl;
+	cudaMemcpy(phi, d_phi, size, cudaMemcpyDeviceToHost);
+	
+
+	double t = dt * steps;
+
+
+	// Передаем ТЕ ЖЕ САМЫЕ параметры xc, yc, zc, sigma0 в exact_solution
+
+	double l2_rel = 0.0;
+	double linf = 0.0;
+	exact_solution(phi_exact, lentgh, width, height, dx, dy, dz, t,
+		xc, yc, zc, u0, v0, w0, nu);
+	double maxdiff = 0;
+	for (int i = 0; i < height * width * lentgh; i++) {
+		maxdiff = std::max(maxdiff, fabs(phi[i] - phi_exact[i]));
+	}
+	compute_error(phi, phi_exact,
+		lentgh, width, height,
+		&l2_rel, &linf);
+	printf("raw maxdiff = %e\n", maxdiff);
+	std::cout << "L2 rel error: " << l2_rel << std::endl;
+	std::cout << "Linf error: " << linf << std::endl;
+	return phi;
+}
+void exchange_halo_3d(double* arr, MPI_Comm cart_comm, int direction,
+	MPI_Datatype send_l, MPI_Datatype send_r,
+	MPI_Datatype recv_l, MPI_Datatype recv_r)
+{
+	int left_neighbor, right_neighbor;
+	// direction: 0 = Z, 1 = Y, 2 = X. ????? ?? 1 ???????.
+	// ??????? ???? ?????????? ID ??????? ? ?????? ????? ?????????????!
+	MPI_Cart_shift(cart_comm, direction, 1, &left_neighbor, &right_neighbor);
+
+	MPI_Request reqs[4];
+
+	// ?????????? ??????????? ????? ???????? ? ????-???? (ghost-??????)
+	MPI_Irecv(arr, 1, recv_l, left_neighbor, 100, cart_comm, &reqs[0]);
+	MPI_Irecv(arr, 1, recv_r, right_neighbor, 101, cart_comm, &reqs[1]);
+
+	// ?????????? ??????????? ???????? ????????? ?????
+	MPI_Isend(arr, 1, send_l, left_neighbor, 101, cart_comm, &reqs[2]);
+	MPI_Isend(arr, 1, send_r, right_neighbor, 100, cart_comm, &reqs[3]);
+
+	// ????? ?????????????: ????, ???? ??? 4 ???????? ?????????? ? ????
+	MPI_Waitall(4, reqs, MPI_STATUSES_IGNORE);
+}
+int height = 128; int width = 128; int lentgh = 128;
+int main(int argc, char** argv)
+{
+	double dx = 1.0 / (lentgh - 4);
+	double dy = 1.0 / (width - 4);
+	double dz = 1.0 / (height - 4);
+
+	int n = height * width * lentgh;
+	int size_arr = height * width * lentgh * sizeof(double);
+	double* phi = nullptr; double* u = nullptr; double* v = nullptr; double* w = nullptr; double* rhs_phi = nullptr;
+	double* phi_tmp = nullptr; double* rhs_tmp = nullptr;
+	double* phi_exact = (double*)malloc(size_arr);
+	double xc = 0.5;
+	double yc = 0.5;
+	double zc = 0.5;
+	double sigma0 = 0.08; // ?????? ?????? (????????? ??? ???? ?????)
+	//double omega = 2.0 * PI;
+	double wz = 0.25;
+
+	double u0 = 1.0;
+	double v0 = 0.5;
+	double w0 = 0.3;
+	double rhs_sum0 = 0.0;
+
+
+	int size, rank, steps;
+	double dx_reverse = 1.0 / dx;
+	double dy_reverse = 1.0 / dy;
+	double dz_reverse = 1.0 / dz;
+	double dt, t_final;
+	MPI_Init(nullptr, nullptr);
+
+	MPI_Comm_size(MPI_COMM_WORLD, &size);
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	if (rank == 0) {
+		std::cout << "MPI Version:" << std::endl;
+	}
+	int dims[3]{ 0,0,0 };
+	MPI_Dims_create(size, 3, dims);
+	int dim_Z = dims[0];
+	int dim_Y = dims[1];
+	int dim_X = dims[2];
+	int phys_H = height - 4;
+	int phys_W = width - 4;
+	int phys_L = lentgh - 4;
+
+	int sub_H = phys_H / dim_Z;
+	int  sub_W = phys_W / dim_Y;
+	int  sub_L = phys_L / dim_X;
+
+	int lz = sub_H + 4;
+	int ly = sub_W + 4;
+	int lx = sub_L + 4;
+	int alloc = lz * ly * lx;
+	double* local_arr_phi = (double*)malloc(alloc * sizeof(double));
+	double* local_arr_u = (double*)malloc(alloc * sizeof(double));
+	double* local_arr_v = (double*)malloc(alloc * sizeof(double));
+	double* local_arr_w = (double*)malloc(alloc * sizeof(double));
+	int periods[3]{ 1, 1, 1 }; // 1 ???????? true (????????????? bc_periodic ?? Z, Y, X)
+	MPI_Comm cart_comm;        // ????????? ???? ????? 3D-"?????"
+
+	// ????????????? ???????? ?? MPI_COMM_WORLD ? 3D-????? cart_comm
+	MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, 0, &cart_comm);
+	int big_sizes[3] = { lz,ly,lx };
+	int sub_Z[3] = { 2,ly,lx }; int sub_Y[3] = { lz,2,lx }; int sub_X[3] = { lz,ly,2 };
+	int s_X_l_c[3] = { 0,0,2 }; int s_X_r_c[3] = { 0,0,lx - 4 }; int r_X_l_c[3] = { 0,0,0 }; int r_X_r_c[3] = { 0,0,lx - 2 };
+	int s_Y_l_c[3] = { 0,2,0 }; int s_Y_r_c[3] = { 0,ly - 4,0 }; int r_Y_l_c[3] = { 0,0,0 }; int r_Y_r_c[3] = { 0,ly - 2,0 };
+	int s_Z_l_c[3] = { 2,0,0 }; int s_Z_r_c[3] = { lz - 4,0,0 }; int r_Z_l_c[3] = { 0,0,0 }; int r_Z_r_c[3] = { lz - 2,0,0 };
+	MPI_Datatype s_Z_l, s_Z_r, r_Z_l, r_Z_r;
+	MPI_Datatype s_Y_l, s_Y_r, r_Y_l, r_Y_r;
+	MPI_Datatype s_X_l, s_X_r, r_X_l, r_X_r;
+	MPI_Type_create_subarray(3, big_sizes, sub_Z, s_Z_l_c, MPI_ORDER_C, MPI_DOUBLE, &s_Z_l);
+	MPI_Type_create_subarray(3, big_sizes, sub_Z, s_Z_r_c, MPI_ORDER_C, MPI_DOUBLE, &s_Z_r);
+	MPI_Type_create_subarray(3, big_sizes, sub_Z, r_Z_l_c, MPI_ORDER_C, MPI_DOUBLE, &r_Z_l);
+	MPI_Type_create_subarray(3, big_sizes, sub_Z, r_Z_r_c, MPI_ORDER_C, MPI_DOUBLE, &r_Z_r);
+
+	MPI_Type_create_subarray(3, big_sizes, sub_Y, s_Y_l_c, MPI_ORDER_C, MPI_DOUBLE, &s_Y_l);
+	MPI_Type_create_subarray(3, big_sizes, sub_Y, s_Y_r_c, MPI_ORDER_C, MPI_DOUBLE, &s_Y_r);
+	MPI_Type_create_subarray(3, big_sizes, sub_Y, r_Y_l_c, MPI_ORDER_C, MPI_DOUBLE, &r_Y_l);
+	MPI_Type_create_subarray(3, big_sizes, sub_Y, r_Y_r_c, MPI_ORDER_C, MPI_DOUBLE, &r_Y_r);
+
+	MPI_Type_create_subarray(3, big_sizes, sub_X, s_X_l_c, MPI_ORDER_C, MPI_DOUBLE, &s_X_l);
+	MPI_Type_create_subarray(3, big_sizes, sub_X, s_X_r_c, MPI_ORDER_C, MPI_DOUBLE, &s_X_r);
+	MPI_Type_create_subarray(3, big_sizes, sub_X, r_X_l_c, MPI_ORDER_C, MPI_DOUBLE, &r_X_l);
+	MPI_Type_create_subarray(3, big_sizes, sub_X, r_X_r_c, MPI_ORDER_C, MPI_DOUBLE, &r_X_r);
+
+	MPI_Type_commit(&s_Z_l); MPI_Type_commit(&s_Z_r); MPI_Type_commit(&r_Z_l); MPI_Type_commit(&r_Z_r);
+	MPI_Type_commit(&s_Y_l); MPI_Type_commit(&s_Y_r); MPI_Type_commit(&r_Y_l); MPI_Type_commit(&r_Y_r);
+	MPI_Type_commit(&s_X_l); MPI_Type_commit(&s_X_r); MPI_Type_commit(&r_X_l); MPI_Type_commit(&r_X_r);
+
+	if (rank == 0) {
+		phi = (double*)malloc(size_arr); u = (double*)malloc(size_arr); v = (double*)malloc(size_arr);
+		w = (double*)malloc(size_arr); phi_tmp = (double*)malloc(size_arr); rhs_tmp = (double*)malloc(size_arr);
+		rhs_phi = (double*)malloc(size_arr);
+
+		fill_velocity(u, v, w, lentgh, width, height, dx, dy, dz, xc, yc, u0, v0, w0);
+		bc_periodic(height, width, lentgh, u); bc_periodic(height, width, lentgh, v); bc_periodic(height, width, lentgh, w);
+		init(phi, lentgh, width, height, dx, dy, dz, xc, yc, zc, 0.0);
+		bc_periodic(height, width, lentgh, phi);
+		for (int i = 2; i < height - 2; i++) {
+			for (int j = 2; j < width - 2; j++) {
+				for (int k = 2; k < lentgh - 2; k++) {
+					int idx = i * width * lentgh + j * lentgh + k;
+					rhs_sum0 += phi[idx];
+				}
+			}
+		}
+		dt = compute_dt(height, width, lentgh, u, v, w, dx, dy, dz, nu, 0.1);
+		t_final = 1.0;
+		steps = int(t_final / dt);
+
+		for (int p = 0; p < size; p++) {
+			int p_z = p / (dim_Y * dim_X);
+			int rem = p % (dim_Y * dim_X);
+			int p_y = rem / dim_X;
+			int p_x = rem % dim_X;
+
+			int start_z = sub_H * p_z;
+			int start_y = sub_W * p_y;
+			int start_x = sub_L * p_x;
+			double* send_buf_phi = (double*)malloc(alloc * sizeof(double));
+			double* send_buf_u = (double*)malloc(alloc * sizeof(double));
+			double* send_buf_v = (double*)malloc(alloc * sizeof(double));
+			double* send_buf_w = (double*)malloc(alloc * sizeof(double));
+
+			for (int z = -2; z < sub_H + 2; z++) {
+				for (int y = -2; y < sub_W + 2; y++) {
+					for (int x = -2; x < sub_L + 2; x++) {
+						int global_z = 2 + ((start_z + z + phys_H) % phys_H);
+						int global_y = 2 + ((start_y + y + phys_W) % phys_W);
+						int global_x = 2 + ((start_x + x + phys_L) % phys_L);
+						int global_idx = global_z * (width * lentgh) + global_y * lentgh + global_x;
+						int local_idx = (z + 2) * ly * lx + (y + 2) * lx + x + 2;
+						send_buf_phi[local_idx] = phi[global_idx];
+						send_buf_u[local_idx] = u[global_idx];
+						send_buf_v[local_idx] = v[global_idx];
+						send_buf_w[local_idx] = w[global_idx];
+					}
+				}
+			}
+			if (p == 0) {
+				memcpy(local_arr_phi, send_buf_phi, alloc * sizeof(double));
+				memcpy(local_arr_u, send_buf_u, alloc * sizeof(double));
+				memcpy(local_arr_v, send_buf_v, alloc * sizeof(double));
+				memcpy(local_arr_w, send_buf_w, alloc * sizeof(double));
+			}
+			else {
+				MPI_Send(send_buf_phi, alloc, MPI_DOUBLE, p, 0, MPI_COMM_WORLD);
+				MPI_Send(send_buf_u, alloc, MPI_DOUBLE, p, 1, MPI_COMM_WORLD);
+				MPI_Send(send_buf_v, alloc, MPI_DOUBLE, p, 2, MPI_COMM_WORLD);
+				MPI_Send(send_buf_w, alloc, MPI_DOUBLE, p, 3, MPI_COMM_WORLD);
+			}
+			free(send_buf_phi); free(send_buf_u); free(send_buf_v); free(send_buf_w);
+		}
+
+	}
+	else {
+		MPI_Status status[4];
+		MPI_Recv(local_arr_phi, alloc, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD, &status[0]);
+		MPI_Recv(local_arr_u, alloc, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD, &status[1]);
+		MPI_Recv(local_arr_v, alloc, MPI_DOUBLE, 0, 2, MPI_COMM_WORLD, &status[2]);
+		MPI_Recv(local_arr_w, alloc, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, &status[3]);
+	}
+	MPI_Bcast(&steps, 1, MPI_INT, 0, MPI_COMM_WORLD);
+	MPI_Bcast(&dt, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Bcast(&rhs_sum0, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Bcast(&t_final, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+	double* rhs_phi_local = (double*)malloc(alloc * sizeof(double));
+	double* rhs_tmp_local = (double*)malloc(alloc * sizeof(double));
+	double* phi_tmp_local = (double*)malloc(alloc * sizeof(double));
+
+	for (int step = 0; step < steps; step++) {
+		//1 step
+		advection_diffusion(sub_H, sub_W, sub_L, local_arr_phi, local_arr_u, local_arr_v, local_arr_w,
+			rhs_phi_local, nu, dx_reverse, dy_reverse, dz_reverse, lz, ly, lx);
+		ssprk2_stage1_cpu(sub_H, sub_W, sub_L, lz, ly, lx, phi_tmp_local, rhs_phi_local, local_arr_phi, dt);
+
+		// ????? ????????? ??? ????????? ???????
+		exchange_halo_3d(phi_tmp_local, cart_comm, 0, s_Z_l, s_Z_r, r_Z_l, r_Z_r); // ?????????? ?? Z
+		exchange_halo_3d(phi_tmp_local, cart_comm, 1, s_Y_l, s_Y_r, r_Y_l, r_Y_r); // ?????????? ?? Y
+		exchange_halo_3d(phi_tmp_local, cart_comm, 2, s_X_l, s_X_r, r_X_l, r_X_r); // ?????????? ?? X
+
+		advection_diffusion(sub_H, sub_W, sub_L, phi_tmp_local, local_arr_u, local_arr_v, local_arr_w,
+			rhs_tmp_local, nu, dx_reverse, dy_reverse, dz_reverse, lz, ly, lx);
+
+
+
+		ssprk2_stage2_cpu(sub_H, sub_W, sub_L, lz, ly, lx, phi_tmp_local, rhs_tmp_local, local_arr_phi, dt);
+		exchange_halo_3d(local_arr_phi, cart_comm, 0, s_Z_l, s_Z_r, r_Z_l, r_Z_r);
+		exchange_halo_3d(local_arr_phi, cart_comm, 1, s_Y_l, s_Y_r, r_Y_l, r_Y_r);
+		exchange_halo_3d(local_arr_phi, cart_comm, 2, s_X_l, s_X_r, r_X_l, r_X_r);
+
+		if (step % 300 == 0) {
+			double local_sum = 0.0;
+			double global_sum = 0.0;
+			for (int i = 2; i < sub_H + 2; i++) {
+				for (int j = 2; j < sub_W + 2; j++) {
+					for (int k = 2; k < sub_L + 2; k++) {
+						int idx = i * lx * ly + j * lx + k;
+						local_sum += local_arr_phi[idx];
+					}
+				}
+			}
+
+
+			MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+			if (rank == 0) {
+
+				std::cout << "Mass diff:" << fabs(global_sum - rhs_sum0) << std::endl;
+			}
+			double* phi_global = nullptr;
+			if (rank == 0)
+			{
+				phi_global = (double*)malloc(
+					height * width * lentgh * sizeof(double));
+			}
+			int local_phys_size = sub_H * sub_W * sub_L;
+
+			double* send_phys =
+				(double*)malloc(local_phys_size * sizeof(double));
+
+			int cnt = 0;
+
+			for (int i = 2; i < sub_H + 2; i++)
+				for (int j = 2; j < sub_W + 2; j++)
+					for (int k = 2; k < sub_L + 2; k++)
+					{
+						int idx = i * ly * lx + j * lx + k;
+						send_phys[cnt++] = local_arr_phi[idx];
+					}
+			double* recv_all = nullptr;
+
+			if (rank == 0)
+			{
+				recv_all =
+					(double*)malloc(size * local_phys_size * sizeof(double));
+			}
+
+			MPI_Gather(
+				send_phys,
+				local_phys_size,
+				MPI_DOUBLE,
+				recv_all,
+				local_phys_size,
+				MPI_DOUBLE,
+				0,
+				MPI_COMM_WORLD);
+			if (rank == 0) {
+				for (int p = 0; p < size; p++)
+				{
+					int p_z = p / (dim_Y * dim_X);
+
+					int rem = p % (dim_Y * dim_X);
+
+					int p_y = rem / dim_X;
+
+					int p_x = rem % dim_X;
+
+					int start_z = sub_H * p_z;
+					int start_y = sub_W * p_y;
+					int start_x = sub_L * p_x;
+
+					int cnt = p * local_phys_size;
+
+					for (int z = 0; z < sub_H; z++)
+						for (int y = 0; y < sub_W; y++)
+							for (int x = 0; x < sub_L; x++)
+							{
+								int gz = start_z + z + 2;
+								int gy = start_y + y + 2;
+								int gx = start_x + x + 2;
+
+								int global_idx =
+									gz * width * lentgh +
+									gy * lentgh +
+									gx;
+
+								phi_global[global_idx] =
+									recv_all[cnt++];
+							}
+				}
+			}
+			if (rank == 0) {
+				double* phi_exact = (double*)malloc(size_arr);
+				double xc = 0.5;
+				double yc = 0.5;
+				double zc = 0.5;
+				double sigma0 = 0.08; // Ширина облака (подберите под вашу сетку)
+				//double omega = 2.0 * PI;
+				double wz = 0.25;
+
+				double u0 = 1.0;
+				double v0 = 0.5;
+				double w0 = 0.3;
+				exact_solution(
+					phi_exact,
+					lentgh, width, height,
+					dx, dy, dz,
+					(step + 1) * dt,
+					xc, yc, zc,
+					u0, v0, w0,
+					nu
+				);
+				double l2_rel = 0.0;
+				double linf = 0.0;
+				compute_error(
+					phi_global,
+					phi_exact,
+					lentgh,
+					width,
+					height,
+					&l2_rel,
+					&linf
+				);
+				std::cout << "L2 rel = " << l2_rel << std::endl;
+				std::cout << "Linf   = " << linf << std::endl;
+			}
+		}
+
+	}
+
+	MPI_Finalize();
+	if (rank == 0) {
+		std::cout << "GPU Version:" << std::endl;
+		gpu_optimized_solution(height, width, lentgh);
+	}
+	
+}
