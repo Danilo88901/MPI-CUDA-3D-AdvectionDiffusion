@@ -1,0 +1,79 @@
+## Results
+
+All numerical results, visualizations, and performance measurements are stored in the `results/` directory.
+
+```text
+results/
+├── figures/       # error convergence, scaling plots, summary figures
+├── plots/         # additional analysis plots and intermediate visualizations
+├── animations/    # time evolution of the 3D scalar field (ParaView exports)
+└── profiling/     # optional profiling data (CPU/GPU timing, Nsight, etc.)
+```
+
+---
+
+## Experimental Setup
+
+All performance experiments were conducted under the following configuration:
+
+- **GPU:** NVIDIA RTX 5050  
+- **CPU (MPI runs):** 8 MPI ranks (single-node execution)
+- **MPI decomposition:** 3D Cartesian domain decomposition
+- **CPU baseline:** single-process reference implementation
+- **Precision:** double precision (unless otherwise specified in code)
+- **Boundary conditions:** periodic in all spatial directions
+
+---
+
+## Performance Measurements
+
+The reported timings include:
+
+- pure compute time (core solver execution)
+- full timestep execution (including boundary exchange for MPI)
+- CUDA kernel execution time
+- optional host-device memory transfer overhead (when enabled)
+
+For fair comparison, separate runs were used for:
+- compute-only benchmarks
+- full pipeline runs with output generation
+
+---
+
+## Important Constraints
+
+- MPI scaling is limited to a single-node configuration (8 ranks).
+- GPU performance depends strongly on grid size and memory coalescing.
+- Small grid sizes may underutilize the GPU and distort scaling results.
+- MPI decomposition assumes full divisibility of the grid by the process layout.
+- I/O (ParaView output generation) can significantly affect wall-time measurements.
+
+---
+
+## Interpretation Notes
+
+- CPU, MPI, and GPU runtimes are not directly comparable without considering memory bandwidth and parallel overhead.
+- Strong scaling behavior is meaningful only within fixed problem size experiments.
+- Weak scaling experiments were not the primary focus of this implementation.
+- Reported speedups should be interpreted as implementation-specific, not hardware-general conclusions.
+
+---
+
+## Outputs
+
+The `results/` directory contains:
+- **Plots:** supplementary visualizations and intermediate analysis results  
+- **Animations:** 3D field evolution over time (ParaView-generated)  
+- **Profiling:** optional performance traces (Nsight Systems / CPU profilers)
+
+---
+
+## Summary
+
+The results demonstrate correctness via analytical solution comparison and quantify performance differences between:
+
+- serial CPU baseline
+- MPI-parallel CPU implementation
+- CUDA implementation on RTX 5050
+
+The primary focus is on correctness validation and implementation-level performance comparison rather than hardware benchmarking.
